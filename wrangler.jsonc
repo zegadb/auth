@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "zega-auth",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": false,
+  "preview_urls": false,
+  "d1_databases": [{
+    "binding": "AUTH_DB",
+    "database_name": "zega-auth",
+    "database_id": "REPLACE_WITH_AUTH_D1_ID",
+    "migrations_dir": "migrations"
+  }],
+  "durable_objects": { "bindings": [{ "name": "AUTH_RATES", "class_name": "AuthRateLimit" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AuthRateLimit"] }],
+  "vars": { "EMAIL_FROM": "Zega <noreply@auth.zega.dev>", "RESEND_API_ORIGIN": "https://api.resend.com" },
+  "env": {
+    "dev": {
+      "name": "zega-auth-dev",
+      "workers_dev": true,
+      "d1_databases": [{ "binding": "AUTH_DB", "database_name": "zega-auth-dev", "database_id": "local-zega-auth-dev", "migrations_dir": "migrations" }],
+      "durable_objects": { "bindings": [{ "name": "AUTH_RATES", "class_name": "AuthRateLimit" }] },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AuthRateLimit"] }],
+      "vars": { "EMAIL_FROM": "Zega <noreply@auth.zega.dev>", "RESEND_API_ORIGIN": "https://api.resend.com", "ALLOW_UNSIGNED_GATE_CONTEXT": "true" }
+    }
+  }
+}
