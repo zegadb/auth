@@ -1,0 +1,9 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "zega-auth-argon2-spike",
+  "main": "./argon2-spike.ts",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"] }]
+}
