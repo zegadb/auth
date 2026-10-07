@@ -8,6 +8,8 @@ const sent = [];
 await mkdir('.tmp', { recursive: true });
 await symlink('../node_modules/argon2-wasm-edge', '.tmp/argon2-wasm-edge', 'dir').catch(error => { if (error.code !== 'EEXIST') throw error; });
 await build({ entryPoints: ['src/index.ts'], outfile: '.tmp/worker.mjs', bundle: true, format: 'esm', platform: 'browser', target: 'es2022', external: ['argon2-wasm-edge/wasm/*.wasm'] });
+await build({ entryPoints: ['src/client.ts'], outfile: '.tmp/client.mjs', bundle: true, format: 'esm', platform: 'node', plugins: [{ name: 'zega-lib-test-shim', setup(build) { build.onResolve({ filter: /^@zegadb\/lib\/client$/ }, () => ({ path: 'zega-lib-client', namespace: 'test-shim' })); build.onLoad({ filter: /.*/, namespace: 'test-shim' }, () => ({ contents: 'export class ZegaError extends Error { constructor(code, message, details = {}) { super(message); this.code = code; this.status = details.status ?? 0; } } export const connect = () => ({});', loader: 'js' })); } }] });
+const { createAuth } = await import('../.tmp/client.mjs');
 const mf = new Miniflare({
   name: 'zega-auth-test', scriptPath: '.tmp/worker.mjs', modules: true,
   compatibilityDate: '2026-08-06', compatibilityFlags: ['nodejs_compat'],
@@ -32,8 +34,8 @@ for (const statement of (await readFile(new URL('../migrations/0001_auth.sql', i
 const ctx = { 'x-zega-project': 'project-a', 'x-zega-graph': 'graph-a' };
 const req = (path, body, key, options = {}) => mf.dispatchFetch(`https://graph-a.zegadb.com/auth/v1/${path}`, {
   method: options.method ?? (body === undefined ? 'GET' : 'POST'),
-  headers: { ...ctx, ...(key ? { authorization: `Bearer ${key}` } : {}), ...(options.headers ?? {}), ...(body === undefined ? {} : { 'content-type': options.contentType ?? 'application/json' }) },
-  body: body === undefined ? undefined : options.rawBody ?? JSON.stringify(body),
+  headers: { ...ctx, ...(key ? { authorization: `Bearer ${key}` } : {}), ...(options.headers ?? {}), ...(body === undefined && options.rawBody === undefined ? {} : { 'content-type': options.contentType ?? 'application/json' }) },
+  body: options.rawBody ?? (body === undefined ? undefined : JSON.stringify(body)),
 });
 const json = response => response.json();
 let publishableKey;
@@ -110,6 +112,46 @@ test('workerd: sign-up, mail confirmation, password sign-in, ES256 JWKS, rotatio
   assert.equal((await req('token', { grant_type: 'refresh_token', refresh_token: rotated.refresh_token }, publishableKey)).status, 401);
   const signout = await req('logout', { refresh_token: rotated.refresh_token }, openedSession.access_token);
   assert.equal(signout.status, 200);
+});
+
+test('workerd: browser URL-encoded verify form succeeds', async () => {
+  const magic = await req('magiclink', { email: 'ada@example.test', redirectTo: 'https://app.example.test/' }, publishableKey);
+  assert.equal(magic.status, 200);
+  const link = sent.at(-1).html.match(/href="([^"]+\/verify\?token=[^"]+)"/)[1];
+  const form = await req('verify', undefined, undefined, { method: 'POST', contentType: 'application/x-www-form-urlencoded', rawBody: new URLSearchParams({ token: new URL(link).searchParams.get('token') }).toString() });
+  assert.equal(form.status, 200, await form.clone().text());
+  assert.equal((await json(form)).user.email, 'ada@example.test');
+});
+
+test('client: local and server getUser verify a live stored session', async () => {
+  const liveSession = await json(await req('token', { grant_type: 'password', email: 'ada@example.test', password: 'correct horse battery staple' }, publishableKey));
+  const serverResponse = await req('user', undefined, liveSession.access_token);
+  assert.equal(serverResponse.status, 200, await serverResponse.text());
+  const values = new Map([['zega.auth.session', JSON.stringify(liveSession)]]);
+  const auth = createAuth({
+    url: 'https://graph-a.zegadb.com', publishableKey,
+    storage: { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), removeItem: key => values.delete(key) },
+    fetch: (input, init) => mf.dispatchFetch(input, { ...init, headers: { ...ctx, ...(init?.headers ?? {}) } }),
+  });
+  assert.equal((await auth.getUser())?.uid, liveSession.user.uid);
+  assert.equal((await auth.getUser({ verify: 'server' }))?.uid, liveSession.user.uid);
+});
+
+test('workerd: five wrong email codes lock the challenge before the correct sixth try', async () => {
+  const email = 'lockout@example.test';
+  await db.prepare('INSERT INTO auth_users(project_id,uid,email,email_verified,created_at) VALUES (?,?,?,?,?)').bind('project-a', 'a_lockout_123456', email, 1, Math.floor(Date.now()/1000)).run();
+  const magic = await req('magiclink', { email, redirectTo: 'https://app.example.test/' }, publishableKey);
+  assert.equal(magic.status, 200);
+  const code = sent.at(-1).html.match(/<strong>(\d{6})<\/strong>/)[1];
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const response = await req('verify', { email, token: '000000' === code ? '000001' : '000000' }, publishableKey, { headers: { 'cf-connecting-ip': `198.51.100.${attempt}` } });
+    assert.equal(response.status, 400);
+  }
+  const attempts = await db.prepare('SELECT MAX(attempts) AS n FROM auth_challenges WHERE project_id=? AND uid=? AND consumed_at IS NULL').bind('project-a', 'a_lockout_123456').first();
+  assert.equal(attempts.n, 5);
+  const sixth = await req('verify', { email, token: code }, publishableKey, { headers: { 'cf-connecting-ip': '198.51.100.99' } });
+  assert.equal(sixth.status, 400);
+  assert.equal((await json(sixth)).error.code, 'invalid_otp');
 });
 
 test('workerd: redirect allow-list and default email request rate limits are enforced', async () => {

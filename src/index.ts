@@ -246,7 +246,13 @@ async function route(request: Request, env: Env, project: Project): Promise<Resp
     const rows = await scope.prepare('SELECT public_jwk FROM auth_keys_signing WHERE project_id = ?').bind(project.project_id).all() as { results: { public_jwk: string }[] };
     return json({ keys: (rows.results ?? []).map(row => JSON.parse(row.public_jwk)) });
   }
-  const input = request.method === 'POST' ? await request.json().catch(() => ({})) as Record<string, unknown> : {};
+  let input: Record<string, unknown> = {};
+  if (request.method === 'POST') {
+    const contentType = request.headers.get('content-type') ?? '';
+    const body = await request.text();
+    if (contentType.includes('application/x-www-form-urlencoded')) input = Object.fromEntries(new URLSearchParams(body).entries());
+    else { try { input = JSON.parse(body) as Record<string, unknown>; } catch { /* invalid JSON remains an empty input */ } }
+  }
   const email = typeof input.email === 'string' ? input.email.trim().toLowerCase() : '';
   if (path === 'signup' && request.method === 'POST') {
     if (!project.allow_signups) return json({ error: { code: 'signups_disabled' } }, 403);
@@ -345,17 +351,20 @@ async function route(request: Request, env: Env, project: Project): Promise<Resp
     return new Response(`<!doctype html><meta charset="utf-8"><title>${label}</title><form method="post" action="/auth/v1/${path}"><input type="hidden" name="token" value="${token}"><button>${label}</button></form>`, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' } });
   }
   if ((path === 'verify' || path === 'confirm') && request.method === 'POST') {
-    let verifyInput = input;
-    if (request.headers.get('content-type')?.includes('application/x-www-form-urlencoded')) verifyInput = Object.fromEntries(new URLSearchParams(await request.text()).entries());
+    const verifyInput = input;
     const code = typeof verifyInput.token === 'string' ? verifyInput.token : '';
     const emailForCode = typeof verifyInput.email === 'string' ? verifyInput.email.trim().toLowerCase() : '';
-    const codeLimit = await rate(env, project.project_id, `verify:ip:${await sha(ip(request))}`, 30, 900)
-      && (!emailForCode || await rate(env, project.project_id, `verify:email:${await sha(emailForCode)}`, 5, 900));
-    if (!codeLimit) return json({ error: { code: 'rate_limited', retryAfter: 900 } }, 429);
+    if (!await rate(env, project.project_id, `verify:ip:${await sha(ip(request))}`, 30, 900)) return json({ error: { code: 'rate_limited', retryAfter: 900 } }, 429);
     const challengeHash = await hmac(env.GATE_CONTEXT_SECRET, code);
-    const row = await scope.prepare('SELECT * FROM auth_challenges WHERE project_id=? AND (challenge_hash=? OR (code_hash=? AND ?<>"" AND uid=(SELECT uid FROM auth_users WHERE project_id=? AND email=?))) AND consumed_at IS NULL AND expires_at>? AND attempts<5').bind(project.project_id, challengeHash, challengeHash, emailForCode, project.project_id, emailForCode, Math.floor(Date.now()/1000)).first() as any;
+    const row = await scope.prepare('SELECT * FROM auth_challenges WHERE project_id=? AND (challenge_hash=? OR (code_hash IS NOT NULL AND ?<>"" AND uid=(SELECT uid FROM auth_users WHERE project_id=? AND email=?))) AND consumed_at IS NULL AND expires_at>? AND attempts<5 ORDER BY CASE WHEN challenge_hash=? OR code_hash=? THEN 0 ELSE 1 END LIMIT 1').bind(project.project_id, challengeHash, emailForCode, project.project_id, emailForCode, Math.floor(Date.now()/1000), challengeHash, challengeHash).first() as any;
     if (!row) return json({ error: { code: 'invalid_otp' } }, 400);
-    await scope.prepare('UPDATE auth_challenges SET consumed_at=? WHERE project_id=? AND challenge_hash=?').bind(Math.floor(Date.now()/1000), project.project_id, row.challenge_hash).run();
+    if (emailForCode && !await rate(env, project.project_id, `verify:email:${await sha(emailForCode)}`, 5, 900)) return json({ error: { code: 'rate_limited', retryAfter: 900 } }, 429);
+    if (row.code_hash && row.code_hash !== challengeHash && row.challenge_hash !== challengeHash) {
+      await scope.prepare('UPDATE auth_challenges SET attempts=attempts+1 WHERE project_id=? AND challenge_hash=? AND consumed_at IS NULL AND expires_at>? AND attempts<5').bind(project.project_id, row.challenge_hash, Math.floor(Date.now()/1000)).run();
+      return json({ error: { code: 'invalid_otp' } }, 400);
+    }
+    const consumed = await scope.prepare('UPDATE auth_challenges SET consumed_at=? WHERE project_id=? AND challenge_hash=? AND consumed_at IS NULL AND expires_at>? AND attempts<5').bind(Math.floor(Date.now()/1000), project.project_id, row.challenge_hash, Math.floor(Date.now()/1000)).run();
+    if (Number(consumed.meta?.changes ?? 0) !== 1) return json({ error: { code: 'invalid_otp' } }, 400);
     if (row.purpose === 'confirm') await scope.prepare('UPDATE auth_users SET email_verified=1 WHERE project_id=? AND uid=?').bind(project.project_id, row.uid).run();
     if (row.purpose === 'reset') {
       const user = await scope.prepare('SELECT uid,email,email_verified FROM auth_users WHERE project_id=? AND uid=?').bind(project.project_id, row.uid).first() as any;
@@ -363,6 +372,16 @@ async function route(request: Request, env: Env, project: Project): Promise<Resp
     }
     const user = await scope.prepare('SELECT uid,email,email_verified FROM auth_users WHERE project_id=? AND uid=?').bind(project.project_id, row.uid).first() as any;
     return json({ ...(await startSession(env, project, user, url.origin)), redirect_to: row.redirect_to });
+  }
+  if (path === 'user' && request.method === 'GET') {
+    const auth = request.headers.get('authorization')?.replace(/^Bearer /i, '') ?? '';
+    const [, payload] = auth.split('.');
+    try {
+      const claims = JSON.parse(new TextDecoder().decode(fromB64url(payload)));
+      const user = await scope.prepare('SELECT u.uid,u.email,u.email_verified,u.status,s.revoked_at,s.expires_at FROM auth_sessions s JOIN auth_users u ON u.project_id=s.project_id AND u.uid=s.uid WHERE s.project_id=? AND s.sid=? AND s.uid=?').bind(project.project_id, claims.sid, claims.sub).first() as any;
+      if (!user || user.revoked_at || user.expires_at <= Date.now()/1000 || user.status !== 'active') return json({ error: { code: 'session_expired' } }, 401);
+      return json({ user: { uid: user.uid, email: user.email, emailVerified: !!user.email_verified, isAnonymous: false } });
+    } catch { return json({ error: { code: 'session_expired' } }, 401); }
   }
   if (path === 'user' && request.method === 'PUT') {
     const auth = request.headers.get('authorization')?.replace(/^Bearer /i, '') ?? '';

@@ -82,7 +82,11 @@ export function createAuth(config: AuthConfig) {
     },
     async getUser(options: { verify?: 'local' | 'server' } = {}): Promise<User | null> {
       const session = await getSession(); if (!session) return null;
-      const claims = await verifyJwt(session.access_token, config.url, fetcher);
+      if (options.verify === 'server') {
+        try { return (await request('user', undefined, session.access_token)).user as User; }
+        catch { return null; }
+      }
+      const claims = await verifyJwt(session.access_token, config.url, fetcher, config.publishableKey);
       return claims ? session.user : null;
     },
     getSession,
@@ -104,13 +108,13 @@ export function createAuth(config: AuthConfig) {
 }
 
 function memoryStorage(): Storage { const values = new Map<string, string>(); return { getItem: k => values.get(k) ?? null, setItem: (k, v) => { values.set(k, v); }, removeItem: k => { values.delete(k); } }; }
-async function verifyJwt(token: string, url: string, fetcher: typeof fetch): Promise<Record<string, unknown> | null> {
+async function verifyJwt(token: string, url: string, fetcher: typeof fetch, publishableKey: string): Promise<Record<string, unknown> | null> {
   const [head, body, sig] = token.split('.'); if (!head || !body || !sig) return null;
   try {
     const header = JSON.parse(new TextDecoder().decode(base64url(head))) as { kid: string; alg: string };
     const claims = JSON.parse(new TextDecoder().decode(base64url(body))) as Record<string, any>;
     if (header.alg !== 'ES256' || claims.exp <= Date.now() / 1000 || claims.iss !== `${url.replace(/\/$/, '')}/auth/v1`) return null;
-    const response = await fetcher(`${url.replace(/\/$/, '')}/auth/v1/.well-known/jwks.json`);
+    const response = await fetcher(`${url.replace(/\/$/, '')}/auth/v1/.well-known/jwks.json`, { headers: { authorization: `Bearer ${publishableKey}` } });
     const keys = (await response.json() as { keys: JsonWebKey[] }).keys;
     const jwk = keys.find(key => (key as JsonWebKey & { kid?: string }).kid === header.kid); if (!jwk) return null;
     const key = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
